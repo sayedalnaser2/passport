@@ -30,37 +30,32 @@ const yymmdd = (s, kind) => {
 };
 const isoToYYMMDD = iso => iso && /^\d{4}-\d\d-\d\d$/.test(iso) ? iso.slice(2, 4) + iso.slice(5, 7) + iso.slice(8, 10) : '';
 
-/* ----- single-field repair -----
-   field/cd as read; kind 'digits' | 'alnum'; hint = value from the visual zone (optional);
-   valid = extra validity test for candidates. Returns {value, cd, ok, edits}. */
-export function fixField(field, cd, kind = 'alnum', hint = '', valid = () => true, maxEdits = 2) {
+/* ----- field repair -----
+   candidates(): every reading of one field (+ its check digit) reachable with <= maxEdits OCR-confusion swaps that
+   satisfies the check digit. A field whose check digit itself was misread is also offered (value kept, digit recomputed).
+   parseTD3 then picks the combination of fields that also satisfies the composite digit, and only if it is unique. */
+export function candidates(field, cd, kind = 'alnum', valid = () => true, maxEdits = 2, hint = '', digitMask = null) {
   if (kind === 'digits') field = dig(field);
-  if (ok(field, cd) && valid(field)) return { value: field, cd, ok: true, edits: 0 };
-  const want = kind === 'digits' ? dig(cd) : cd;
-  if (hint && hint.length === field.length && valid(hint)) {
-    const diff = [...field].filter((c, i) => c !== hint[i]).length;
-    if (diff === 0) return { value: field, cd: String(checkDigit(field)), ok: true, edits: 0, viaViz: true }; // printed check digit was misread
-    if (diff <= 3 && ok(hint, want)) return { value: hint, cd: want, ok: true, edits: diff, viaViz: true };
-  }
+  cd = dig(cd); // check digits are always numeric
+  if (ok(field, cd) && valid(field)) return [{ value: field, cd, edits: 0 }];
+  const want = cd, out = [];
+  if (hint && hint === field && valid(field)) out.push({ value: field, cd: String(checkDigit(field)), edits: 1, cdFixed: true }); // printed page confirms the value → only the digit was misread
   const cdOptions = /\d/.test(want) ? [want] : [want, ...(ALT[want] || [])];
-  const cands = [];
-  const alts = [...field].map(c => (kind === 'digits' ? (ALT[c] || [c]).filter(x => /\d/.test(x)) : ALT[c] || [c]));
-  const n = field.length;
-  const rec = (i, cur, edits, start) => {
-    if (cdOptions.some(d => ok(cur.join(''), d)) && valid(cur.join(''))) cands.push({ value: cur.join(''), edits });
+  const alts = [...field].map((c, i) => kind === 'digits' || (digitMask && digitMask.has(i)) ? (ALT[c] || [c]).filter(x => /\d/.test(x)) : ALT[c] || [c]);
+  const n = field.length, cur = [...field];
+  const rec = (edits, start) => {
+    const v = cur.join('');
+    if (edits && cdOptions.some(d => ok(v, d)) && valid(v)) out.push({ value: v, cd: cdOptions.find(d => ok(v, d)), edits });
     if (edits >= maxEdits) return;
-    for (let j = start; j < n; j++) for (const a of alts[j]) {
-      if (a === field[j] || (cur[j] !== field[j])) continue;
-      cur[j] = a; rec(j + 1, cur, edits + 1, j + 1); cur[j] = field[j];
-    }
+    for (let j = start; j < n; j++) for (const a of alts[j]) { if (a === field[j]) continue; const o = cur[j]; cur[j] = a; rec(edits + 1, j + 1); cur[j] = o; }
   };
-  rec(0, [...field], 0, 0);
-  if (!cands.length) return { value: field, cd, ok: false, edits: 0 };
-  if (hint) { const h = cands.find(c => c.value === hint); if (h) return { value: h.value, cd: want, ok: true, edits: h.edits }; }
-  cands.sort((a, b) => a.edits - b.edits);
-  const best = cands.filter(c => c.edits === cands[0].edits);
-  if (best.length === 1) return { value: best[0].value, cd: cdOptions.find(d => ok(best[0].value, d)), ok: true, edits: best[0].edits };
-  return { value: field, cd, ok: false, edits: 0, ambiguous: best.map(b => b.value) };
+  rec(0, 0);
+  if (hint && hint.length === field.length && hint !== field && valid(hint) && cdOptions.some(d => ok(hint, d))) { // value read from the printed page that satisfies the check digit
+    const diff = [...field].filter((c, i) => c !== hint[i]).length;
+    if (diff <= 3 && !out.some(o => o.value === hint)) out.push({ value: hint, cd: cdOptions.find(d => ok(hint, d)), edits: diff, viaViz: true });
+  }
+  if (!out.length) out.push({ value: field, cd, edits: 0, bad: true });
+  return out.sort((x, y) => x.edits - y.edits);
 }
 
 /** Find the two MRZ lines in OCR text. */
@@ -91,6 +86,8 @@ export function voteLines(lines) {
 /** Parse two MRZ lines. viz (optional): {passportNo,dob,expiry,personalNo,sex} for steering repairs. */
 export function parseTD3(r1, r2, viz = {}) {
   let l1 = fixLen(clean(r1)), l2 = fixLen(clean(r2));
+  const pre = l1.match(/^[P<]{0,2}B?HR/); // lost/garbled "P<BHR" prefix (Bahraini passports) → restore so the name field stays aligned
+  if (pre && pre[0] !== 'P<BHR') l1 = 'P<BHR' + l1.slice(pre[0].length);
   l1 = l1.replace(/<[<KCLI1]{3,}$/, m => '<'.repeat(m.length));
   const issuer = alp(l1.slice(2, 5)), nameField = l1.slice(5);
   const [sur, ...giv] = nameField.replace(/<+$/, '').split('<<');
@@ -98,24 +95,53 @@ export function parseTD3(r1, r2, viz = {}) {
   const surname = alp((sur || '').replace(/</g, ' ')).trim(), given = alp((giv[0] || '').replace(/</g, ' ')).trim();
 
   const nat = alp(l2.slice(10, 13));
-  const pnRaw = l2.slice(28, 42);
-  const doc = fixField(l2.slice(0, 9), l2[9], 'alnum', clean(viz.passportNo || '').padEnd(9, '<'));
-  const dob = fixField(l2.slice(13, 19), l2[19], 'digits', isoToYYMMDD(viz.dob), validDate);
-  const exp = fixField(l2.slice(21, 27), l2[27], 'digits', isoToYYMMDD(viz.expiry), validDate);
-  const pnEmpty = pnRaw.replace(/</g, '') === '';
-  const pnDigits = pnRaw.replace(/</g, '').split('').filter(c => /[0-9OQDILZSBGT]/.test(c)).length >= 0.7 * pnRaw.replace(/</g, '').length;
-  const pn = pnEmpty ? { value: pnRaw, cd: l2[42], ok: true } : fixField(pnRaw, l2[42], pnDigits ? 'digits' : 'alnum', clean(viz.personalNo || '').padEnd(14, '<'));
-  let sexC = l2[20]; if (sexC !== 'M' && sexC !== 'F') sexC = viz.sex || ({ H: 'M', N: 'M', P: 'F', E: 'F' }[sexC] || '');
-  const fin = l2[43];
-  const body = doc.value + doc.cd + nat + dob.value + dob.cd + (l2[20] === 'M' || l2[20] === 'F' ? l2[20] : sexC || '<') + exp.value + exp.cd + pn.value + pn.cd;
-  const comp = body.slice(0, 10) + body.slice(13, 20) + body.slice(21, 43);
-  const checks = { passportNo: doc.ok, dob: dob.ok, expiry: exp.ok, personalNo: pn.ok, composite: ok(comp, dig(fin)) };
-  const repaired = [doc, dob, exp, pn].some(f => f.edits);
+  let pnRaw = l2.slice(28, 42);
+  const pnCore = pnRaw.replace(/</g, ''), pnEmpty = pnCore === '';
+  const pnDigits = !pnEmpty && [...pnCore].filter(c => /[0-9OQDILZSBGT]/.test(c)).length >= 0.7 * pnCore.length; // CPR numbers are all digits
+  if (pnDigits) { pnRaw = dig(pnRaw); const last = pnRaw.search(/\d(?!.*\d)/); pnRaw = pnRaw.slice(0, last + 1) + '<'.repeat(pnRaw.length - last - 1); } // anything after the last digit is filler
+  const sexOk = l2[20] === 'M' || l2[20] === 'F';
+  let sexC = sexOk ? l2[20] : viz.sex || ({ H: 'M', N: 'M', P: 'F', E: 'F' }[l2[20]] || '');
+  const fin = dig(l2[43]);
+
+  // passport numbers look like <letter><7 digits><filler>: when the tail is clearly digits, read look-alike letters as digits.
+  // (the check digit cannot tell e.g. 'G' from '6' or 'K' from '<', so this prior is the only defence)
+  let docRaw = l2.slice(0, 9), docMask = null;
+  if ([...docRaw.slice(1, 8)].filter(c => /\d/.test(c)).length >= 5) docRaw = docRaw[0] + dig(docRaw.slice(1, 8)) + (/[KCL]/.test(docRaw[8]) ? '<' : docRaw[8]), docMask = new Set([1, 2, 3, 4, 5, 6, 7]);
+  const hint = { doc: clean(viz.passportNo || '').padEnd(9, '<'), dob: isoToYYMMDD(viz.dob), exp: isoToYYMMDD(viz.expiry), pn: clean(viz.personalNo || '').padEnd(14, '<') };
+  const C = {
+    doc: candidates(docRaw, l2[9], 'alnum', docMask ? v => /^\d{7}$/.test(v.slice(1, 8)) : () => true, 2, hint.doc, docMask),
+    dob: candidates(l2.slice(13, 19), l2[19], 'digits', validDate, 2, hint.dob),
+    exp: candidates(l2.slice(21, 27), l2[27], 'digits', validDate, 2, hint.exp),
+    pn: pnEmpty ? [{ value: pnRaw, cd: l2[42], edits: 0 }] : candidates(pnRaw, l2[42], pnDigits ? 'digits' : 'alnum', pnDigits ? v => /^\d+<*$/.test(v) : () => true, 2, hint.pn),
+  };
+  for (const k in C) { const h = C[k].find(c => c.viaViz); C[k] = C[k].slice(0, 8); if (h && !C[k].includes(h)) C[k].push(h); }
+  const compOf = (d, b, e, p) => { const body = d.value + d.cd + nat + b.value + b.cd + (sexC || '<') + e.value + e.cd + p.value + p.cd; return [body, body.slice(0, 10) + body.slice(13, 20) + body.slice(21, 43)]; };
+  // joint search: only combinations whose composite digit also matches; cheapest wins, must be unique (ties broken by printed values)
+  const sols = [];
+  for (const d of C.doc) for (const b of C.dob) for (const e of C.exp) for (const p of C.pn) {
+    if (d.bad || b.bad || e.bad || p.bad) continue; const edits = d.edits + b.edits + e.edits + p.edits; if (edits > 3) continue;
+    if (ok(compOf(d, b, e, p)[1], fin)) sols.push({ d, b, e, p, edits, hit: (d.value === hint.doc) + (b.value === hint.dob) + (e.value === hint.exp) + (p.value === hint.pn) });
+  }
+  sols.sort((x, y) => x.edits - y.edits || y.hit - x.hit);
+  let pick = sols.length && (sols.length === 1 || sols[0].edits < sols[1].edits || sols[0].hit > sols[1].hit) ? sols[0] : null, compositeOk = !!pick, finFixed = false;
+  const zero = { d: C.doc[0], b: C.dob[0], e: C.exp[0], p: C.pn[0] };
+  if (!pick) {
+    const allClean = Object.values(zero).every(c => c.edits === 0 && !c.bad);
+    pick = { ...zero }; if (allClean) { compositeOk = true; finFixed = true; } // only the final digit was misread
+  }
+  const { d: doc, b: dob, e: exp, p: pn } = pick;
+  const [body, comp] = compOf(doc, dob, exp, pn);
+  const checks = {
+    passportNo: ok(doc.value, doc.cd) || !!doc.cdFixed, dob: ok(dob.value, dob.cd) || !!dob.cdFixed, expiry: ok(exp.value, exp.cd) || !!exp.cdFixed,
+    personalNo: pnEmpty || ok(pn.value, pn.cd) || !!pn.cdFixed, composite: compositeOk,
+  };
+  const repaired = [doc, dob, exp, pn].some(f => f.edits) || finFixed;
+  const finDigit = compositeOk ? String(checkDigit(comp)) : l2[43];
   return {
     docType: l1[0] === 'P' ? 'Passport' : l1[0], issuer, surname, given,
     passportNo: doc.value.replace(/</g, ''), nationality: nat, dob: yymmdd(dob.value, 'dob'), sex: sexC, expiry: yymmdd(exp.value, 'exp'),
     personalNo: pn.value.replace(/</g, ''),
-    mrz1: l1, mrz2: body + (checks.composite ? fin : l2[43]),
+    mrz1: l1, mrz2: body + finDigit,
     checks, valid: Object.values(checks).every(Boolean), repaired,
   };
 }

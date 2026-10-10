@@ -157,6 +157,7 @@ function reconcile(mrz, v) {
     if (!m && p) { rec[k] = p; rec.sources[k] = 'printed'; }
     else if (m && !p && !mrz.valid) rec.sources[k] = 'MRZ (unverified)';
   }
+  if (rec.passportNo && !/^[A-Z]{0,2}\d{6,8}$/.test(rec.passportNo)) rec.mismatch.push(`passportNo: unusual format "${rec.passportNo}" – verify letters/digits`);
   rec.placeOfBirth = v.pob || ''; rec.issueDate = v.issue || ''; rec.authority = v.authority || ''; rec.nationalityText = v.nationality || '';
   rec.vizRead = Object.keys(v).length;
   if (!rec.nationality && /BAHRAIN/.test(rec.nationalityText)) rec.nationality = 'BHR';
@@ -181,7 +182,9 @@ async function* pagesOf(file) {
     }
   } else yield [file.name, await imageToCanvas(file)];
 }
-async function addFiles(files) {
+let queue = Promise.resolve();
+const addFiles = files => { files = [...files]; return (queue = queue.then(() => addFilesNow(files))); }; // copy now: the <input> list is cleared right after onchange // never run two OCR jobs at once
+async function addFilesNow(files) {
   files = [...files];
   try {
     let n = 0;
@@ -235,9 +238,9 @@ function render() {
 $('#sheet').addEventListener('change', e => {
   const tr = e.target.closest('tr'); if (!tr) return; const r = rows[tr.dataset.i];
   if (e.target.dataset.m) { // MRZ edited → re-parse the whole row
-    const inp = tr.querySelectorAll('[data-m]'), old = r.rec || {};
+    const inp = tr.querySelectorAll('[data-m]');
     const n = parseTD3(inp[0].value || '', inp[1].value || '', r.viz && { passportNo: r.viz.passportNo, dob: r.viz.dob, expiry: r.viz.expiry, personalNo: r.viz.personalNo, sex: r.viz.sex });
-    r.rec = { ...n, placeOfBirth: old.placeOfBirth, issueDate: old.issueDate, authority: old.authority, nationalityText: old.nationalityText, vizRead: old.vizRead, mismatch: [] }; render();
+    r.rec = reconcile(n, r.viz || {}); render();
   } else if (r.rec && e.target.dataset.k) {
     const k = e.target.dataset.k; let v = e.target.value.trim();
     if (DATE.has(k)) { const m = v.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/); v = m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : v; }
@@ -249,7 +252,7 @@ function showDebug() { const on = $('#dbgOn').checked, pre = $('#dbg'); pre.hidd
 $('#dbgOn').onchange = showDebug;
 window.__passportRows = rows; // handy from the console: __passportRows[0].log
 $('#sheet').addEventListener('click', e => {
-  if (e.target.dataset.dbg !== undefined) { dbgRow = +e.target.closest('tr').dataset.i; $('#dbgOn').checked = true; showDebug(); return; } if (e.target.dataset.del !== undefined) { rows.splice(e.target.closest('tr').dataset.i, 1); render(); } });
+  if (e.target.dataset.dbg !== undefined) { dbgRow = +e.target.closest('tr').dataset.i; $('#dbgOn').checked = true; showDebug(); return; } if (e.target.dataset.del !== undefined) { rows.splice(e.target.closest('tr').dataset.i, 1); dbgRow = -1; render(); } });
 
 /* ---------- export ---------- */
 const HEAD = [...COLS.map(c => c[1]), 'Full name', 'Verified', 'Notes', 'MRZ line 1', 'MRZ line 2'];
