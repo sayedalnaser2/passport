@@ -10,3 +10,7 @@
 #sheet tr.bad{background:color-mix(in srgb,var(--bad) 6%,transparent)}
 #sheet td.thumb-c img{height:44px;display:block;margin:2px 6px;border-radius:4px}
 #sheet td.x button{border:0;background:none;color:var(--bad);padding:6px 10px}
+
+#sheet tr.warn td.st{color:#d97706}#sheet tr.warn{background:color-mix(in srgb,#d97706 7%,transparent)}
+#sheet td.num{padding:0 8px;cursor:pointer;color:var(--mute)}
+#dbg{background:#0d1117;color:#c9d1d9;padding:12px;border-radius:10px;font-size:12px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-all}

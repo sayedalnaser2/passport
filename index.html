@@ -22,10 +22,12 @@
     <button id="csv">Download CSV</button>
     <button id="copy">Copy to clipboard</button>
     <button id="clear" class="danger">Clear all</button>
+    <label class="note"><input type="checkbox" id="dbgOn"> debug log</label>
     <span class="note" id="summary"></span>
   </div>
   <div class="tablewrap"><table id="sheet" hidden><thead></thead><tbody></tbody></table></div>
-  <p class="note">Tip: use a straight, well-lit photo/scan where the two lines at the bottom of the photo page (<code>P&lt;BHR…</code>) are visible. Rows marked ⚠ failed a check-digit test – correct the MRZ lines (last two columns) and the fields re-calculate. The OCR engine (~10 MB) downloads once from a CDN; the passport images never leave your device.</p>
+  <pre id="dbg" hidden></pre>
+  <p class="note">Tip: use a straight, well-lit photo/scan where the two lines at the bottom of the photo page (<code>P&lt;BHR…</code>) are visible. Besides the MRZ, the printed fields (place of birth, issue date, authority…) are read and compared. ✔ = verified by check digits and printed page, ≈ = MRZ ok but printed page differs, ⚠ = needs checking. Click a row number for the debug log; correct the MRZ lines (last two columns) and the fields re-calculate. The OCR engine (~10 MB) downloads once from a CDN; the passport images never leave your device.</p>
 </main>
 <div id="busy" hidden><div class="busybox"><div class="spin"></div><div id="busytext">Working…</div><div class="bar"><i id="busybar"></i></div></div></div>
 <div id="toasts"></div>
