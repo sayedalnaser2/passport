@@ -1,0 +1,12 @@
+.tablewrap{overflow:auto;margin-top:14px;background:var(--card);border:1px solid var(--bd);border-radius:var(--r)}
+#sheet{border-collapse:collapse;width:100%;font-size:13.5px}
+#sheet th,#sheet td{border-bottom:1px solid var(--bd);border-right:1px solid var(--bd);padding:0;white-space:nowrap}
+#sheet th{background:var(--bg);padding:8px 10px;text-align:left;position:sticky;top:0}
+#sheet td input{border:0;background:transparent;padding:7px 8px;width:100%;min-width:90px;border-radius:0}
+#sheet td input:focus{outline:2px solid var(--pri2);background:var(--bg)}
+#sheet td.mrz input{font-family:ui-monospace,Menlo,Consolas,monospace;min-width:370px;letter-spacing:.3px}
+#sheet td.st{text-align:center;padding:0 8px;cursor:help}
+#sheet tr.bad td.st{color:var(--bad)}#sheet tr.good td.st{color:var(--ok)}
+#sheet tr.bad{background:color-mix(in srgb,var(--bad) 6%,transparent)}
+#sheet td.thumb-c img{height:44px;display:block;margin:2px 6px;border-radius:4px}
+#sheet td.x button{border:0;background:none;color:var(--bad);padding:6px 10px}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bahrain Passport Reader – batch MRZ to Excel</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="passport.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="index.html">🛂 <b>Passport</b> Reader</a>
+  <div class="badges"><span class="badge">🔒 100% on your device</span></div>
+</header>
+<main>
+  <h1>Bahraini passport reader</h1>
+  <p class="sub">Drop many passport scans (JPG, PNG or PDF). The machine-readable zone is read, check-digits are verified, and everything lands in one sheet you can edit and download as Excel / CSV.</p>
+  <label class="drop" id="drop" for="file"><b>Drop passport images / PDFs here, or click to choose</b>You can select many at once · nothing is uploaded</label>
+  <input type="file" id="file" accept="image/*,application/pdf" multiple hidden>
+  <div class="row" id="bar" hidden>
+    <button id="xlsx" class="primary">⬇ Download Excel (.xlsx)</button>
+    <button id="csv">Download CSV</button>
+    <button id="copy">Copy to clipboard</button>
+    <button id="clear" class="danger">Clear all</button>
+    <span class="note" id="summary"></span>
+  </div>
+  <div class="tablewrap"><table id="sheet" hidden><thead></thead><tbody></tbody></table></div>
+  <p class="note">Tip: use a straight, well-lit photo/scan where the two lines at the bottom of the photo page (<code>P&lt;BHR…</code>) are visible. Rows marked ⚠ failed a check-digit test – correct the MRZ lines (last two columns) and the fields re-calculate. The OCR engine (~10 MB) downloads once from a CDN; the passport images never leave your device.</p>
+</main>
+<div id="busy" hidden><div class="busybox"><div class="spin"></div><div id="busytext">Working…</div><div class="bar"><i id="busybar"></i></div></div></div>
+<div id="toasts"></div>
+<script src="vendor/jszip.min.js"></script>
+<script type="module" src="passport.js"></script>
+</body>
+</html>
