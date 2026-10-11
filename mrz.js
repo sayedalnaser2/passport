@@ -75,9 +75,17 @@ export function findMrzLines(text) {
 
 const fixLen = (l, n = 44) => l.length >= n ? l.slice(0, n) : l + '<'.repeat(n - l.length);
 
+/** Line 1 of Bahraini passports starts "P<BHR" (ordinary) or "PDBHR" (diplomatic); OCR often drops/garbles the first characters. */
+export function fixPrefix(l1) {
+  const i = l1.slice(0, 8).indexOf('BHR');
+  if (i >= 0 && i <= 4) { const head = l1.slice(0, i); const code = head.length >= 2 ? head.slice(-2) : head === 'P' || head === '' ? 'P<' : /^[DOS]$/.test(head) ? 'P' + head : 'P<'; return code + l1.slice(i); }
+  const pre = l1.match(/^[P<]{0,2}B?HR/); // "BHR" itself damaged
+  return pre && pre[0] !== 'P<BHR' ? 'P<BHR' + l1.slice(pre[0].length) : l1;
+}
+
 /** Per-position vote over several readings of the same line (all normalised to 44 chars). */
 export function voteLines(lines) {
-  lines = lines.map(l => fixLen(clean(l)));
+  lines = lines.map(l => fixLen(fixPrefix(clean(l))));
   let out = '';
   for (let i = 0; i < 44; i++) { const c = {}; for (const l of lines) c[l[i]] = (c[l[i]] || 0) + 1; out += Object.entries(c).sort((a, b) => b[1] - a[1])[0][0]; }
   return out;
@@ -86,13 +94,13 @@ export function voteLines(lines) {
 /** Parse two MRZ lines. viz (optional): {passportNo,dob,expiry,personalNo,sex} for steering repairs. */
 export function parseTD3(r1, r2, viz = {}) {
   let l1 = fixLen(clean(r1)), l2 = fixLen(clean(r2));
-  const pre = l1.match(/^[P<]{0,2}B?HR/); // lost/garbled "P<BHR" prefix (Bahraini passports) → restore so the name field stays aligned
-  if (pre && pre[0] !== 'P<BHR') l1 = 'P<BHR' + l1.slice(pre[0].length);
+  l1 = fixLen(fixPrefix(l1)); // restore a lost/garbled prefix so the name field stays aligned
   l1 = l1.replace(/<[<KCLI1]{3,}$/, m => '<'.repeat(m.length));
   const issuer = alp(l1.slice(2, 5)), nameField = l1.slice(5);
   const [sur, ...giv] = nameField.replace(/<+$/, '').split('<<');
   // '<<' separates surname from given names; anything after a second '<<' is filler misread by OCR
-  const surname = alp((sur || '').replace(/</g, ' ')).trim(), given = alp((giv[0] || '').replace(/</g, ' ')).trim();
+  const stripTail = t => t.replace(/[KCLI1]{4,}$/, '').trim(); // filler misread glued to the last name
+  const surname = alp(stripTail((sur || '').replace(/</g, ' '))).trim(), given = alp(stripTail((giv[0] || '').replace(/</g, ' '))).trim();
 
   const nat = alp(l2.slice(10, 13));
   let pnRaw = l2.slice(28, 42);
@@ -103,13 +111,15 @@ export function parseTD3(r1, r2, viz = {}) {
   let sexC = sexOk ? l2[20] : viz.sex || ({ H: 'M', N: 'M', P: 'F', E: 'F' }[l2[20]] || '');
   const fin = dig(l2[43]);
 
-  // passport numbers look like <letter><7 digits><filler>: when the tail is clearly digits, read look-alike letters as digits.
-  // (the check digit cannot tell e.g. 'G' from '6' or 'K' from '<', so this prior is the only defence)
-  let docRaw = l2.slice(0, 9), docMask = null;
-  if ([...docRaw.slice(1, 8)].filter(c => /\d/.test(c)).length >= 5) docRaw = docRaw[0] + dig(docRaw.slice(1, 8)) + (/[KCL]/.test(docRaw[8]) ? '<' : docRaw[8]), docMask = new Set([1, 2, 3, 4, 5, 6, 7]);
+  // Bahraini passport numbers: 7 digits + "<<" (ordinary, e.g. 2676812<<) or letter + 7 digits + "<" (diplomatic, e.g. D0001642<).
+  // The check digit cannot tell e.g. 'G' from '6' or 'K' from '<', so this format prior is the only defence.
+  let docRaw = l2.slice(0, 9), docMask = null, docValid = () => true;
+  const filler = c => c === '<' || /[KCL]/.test(c);
+  if (filler(docRaw[7]) && filler(docRaw[8])) { docRaw = dig(docRaw.slice(0, 7)) + '<<'; docMask = new Set([0, 1, 2, 3, 4, 5, 6]); docValid = v => /^\d{7}<<$/.test(v); }
+  else if (filler(docRaw[8])) { docRaw = docRaw[0] + dig(docRaw.slice(1, 8)) + '<'; docMask = new Set([1, 2, 3, 4, 5, 6, 7]); docValid = v => /^.\d{7}<$/.test(v); }
   const hint = { doc: clean(viz.passportNo || '').padEnd(9, '<'), dob: isoToYYMMDD(viz.dob), exp: isoToYYMMDD(viz.expiry), pn: clean(viz.personalNo || '').padEnd(14, '<') };
   const C = {
-    doc: candidates(docRaw, l2[9], 'alnum', docMask ? v => /^\d{7}$/.test(v.slice(1, 8)) : () => true, 2, hint.doc, docMask),
+    doc: candidates(docRaw, l2[9], 'alnum', docValid, 2, hint.doc, docMask),
     dob: candidates(l2.slice(13, 19), l2[19], 'digits', validDate, 2, hint.dob),
     exp: candidates(l2.slice(21, 27), l2[27], 'digits', validDate, 2, hint.exp),
     pn: pnEmpty ? [{ value: pnRaw, cd: l2[42], edits: 0 }] : candidates(pnRaw, l2[42], pnDigits ? 'digits' : 'alnum', pnDigits ? v => /^\d+<*$/.test(v) : () => true, 2, hint.pn),
@@ -138,7 +148,7 @@ export function parseTD3(r1, r2, viz = {}) {
   const repaired = [doc, dob, exp, pn].some(f => f.edits) || finFixed;
   const finDigit = compositeOk ? String(checkDigit(comp)) : l2[43];
   return {
-    docType: l1[0] === 'P' ? 'Passport' : l1[0], issuer, surname, given,
+    docTypeCode: l1.slice(0, 2).replace(/</g, ''), docType: ({ P: 'Passport', PD: 'Diplomatic passport', PO: 'Official passport', PS: 'Special passport' })[l1.slice(0, 2).replace(/</g, '')] || l1.slice(0, 2).replace(/</g, ''), issuer, surname, given,
     passportNo: doc.value.replace(/</g, ''), nationality: nat, dob: yymmdd(dob.value, 'dob'), sex: sexC, expiry: yymmdd(exp.value, 'exp'),
     personalNo: pn.value.replace(/</g, ''),
     mrz1: l1, mrz2: body + finDigit,

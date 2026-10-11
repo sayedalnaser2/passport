@@ -17,3 +17,10 @@ Limits: OCR is English only (Arabic text is ignored); printed fields without che
 
 ## Speed
 Several passports are read in parallel (one OCR worker pair per slot, up to 3), the printed page is OCR'd at the same time as the MRZ search, rotation/tilt searches only run when the first pass fails, and a 3 MB quantised language model is used instead of the 11 MB default. The debug log lists per-stage timings (⏱).
+
+## Bahraini passport versions
+Tuned on real scans of the **ordinary passport** (7-digit number + `<<`, `NAME OF BEARER`, occupation, `dd/mm/yyyy`) and the **diplomatic passport** (`PD`, letter + 7 digits, `NAME`, authority, `dd.mm.yyyy`).
+- MRZ: both number formats, type code (`P`/`PD`/…), CPR = 9 digits starting with the birth `YYMM` (used as a consistency check).
+- Printed page: Arabic text and guilloche backgrounds break label reading, so values are found by *shape* (dates in chronological order, passport/CPR numbers, ALL-CAPS name line, Bahrain place/occupation lexicons) and cross-checked against the MRZ; hard scans are re-read on the red channel at higher scale.
+- Names (no check digit): glued tokens (`YASERCALI`) are split with a name lexicon (`names.js`); anything still garbled is flagged ≈.
+- Your own samples: put scans + an `answers.json` (file → expected fields) in `samples/` (git-ignored, it holds personal data) and run `node tests/run_samples.js`.

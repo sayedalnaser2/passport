@@ -1,6 +1,7 @@
 import * as pdfjsLib from './vendor/pdf.min.mjs';
-import { findMrzLines, parseTD3, voteLines, dmy } from './mrz.js';
+import { findMrzLines, parseTD3, voteLines, clean, dmy } from './mrz.js';
 import { parseViz, lev } from './viz.js';
+import { repairTokens } from './names.js';
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 
 const $ = s => document.querySelector(s);
@@ -12,7 +13,7 @@ const COLS = [
   ['file', 'File'], ['surname', 'Surname'], ['given', 'Given names'], ['passportNo', 'Passport No.'],
   ['nationality', 'Nationality'], ['dob', 'Date of birth'], ['sex', 'Sex'], ['expiry', 'Date of expiry'],
   ['issuer', 'Issuing country'], ['personalNo', 'CPR / Personal No.'],
-  ['placeOfBirth', 'Place of birth'], ['issueDate', 'Date of issue'], ['authority', 'Authority'],
+  ['placeOfBirth', 'Place of birth'], ['issueDate', 'Date of issue'], ['authority', 'Authority'], ['occupation', 'Occupation'], ['docTypeCode', 'Type'],
 ];
 const DATE = new Set(['dob', 'expiry', 'issueDate']);
 const rows = []; // {file, thumb, rec, error}
@@ -48,11 +49,26 @@ function crop(src, y0, targetW, mode) {
   const sy = Math.floor(src.height * y0), sh = src.height - sy, k = targetW / src.width;
   const c = toCanvas(targetW, sh * k), x = c.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
   x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, sy, src.width, sh, 0, 0, c.width, c.height);
-  return mode === 'bin' ? adaptive(c) : mode === 'gray' ? stretch(c) : c;
+  return mode === 'bin' ? adaptive(c) : mode === 'gray' ? stretch(c) : mode === 'red' ? stretch(c, true) : c;
 }
-function stretch(c) { // grayscale + auto-contrast (1%..99% percentile)
+function cropRect(src, sx, sy, sw, sh, targetW, mode) { // crop an arbitrary rectangle (src pixels), scaled to targetW
+  sx = Math.max(0, sx); sy = Math.max(0, sy); sw = Math.min(src.width - sx, sw); sh = Math.min(src.height - sy, sh);
+  const c = toCanvas(targetW, sh * targetW / sw), x = c.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
+  x.imageSmoothingQuality = 'high'; x.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return mode === 'bin' ? adaptive(c) : stretch(c);
+}
+/** Re-read MRZ line 1 (the one with free-text names, not covered by check digits) on its own, at higher resolution, single-line mode. */
+async function rereadLine1(mrzW, src, y0, data, line1) {
+  const L = (data.lines || []).find(l => clean(l.text) === line1); if (!L) return [];
+  const k = MRZ_W / src.width, hgt = L.bbox.y1 - L.bbox.y0, top = Math.floor(src.height * y0) + (L.bbox.y0 - hgt * .45) / k, h = (hgt * 1.9) / k, out = [];
+  await mrzW.setParameters({ tessedit_pageseg_mode: '7' });
+  for (const mode of ['gray', 'bin']) { const r = await mrzW.recognize(cropRect(src, 0, top, src.width, h, 2400, mode)); out.push(clean(r.data.text.split('\n').filter(t => t.trim()).sort((a, b) => b.length - a.length)[0] || '')); }
+  await mrzW.setParameters({ tessedit_pageseg_mode: '6' });
+  return out.filter(t => t.length >= 30);
+}
+function stretch(c, red) { // grayscale (or red channel only) + auto-contrast (1%..99% percentile)
   const x = c.getContext('2d'), im = x.getImageData(0, 0, c.width, c.height), d = im.data, h = new Uint32Array(256);
-  for (let i = 0; i < d.length; i += 4) { const g = (d[i] * .299 + d[i + 1] * .587 + d[i + 2] * .114) | 0; d[i] = g; h[g]++; }
+  for (let i = 0; i < d.length; i += 4) { const g = red ? d[i] : (d[i] * .299 + d[i + 1] * .587 + d[i + 2] * .114) | 0; d[i] = g; h[g]++; }
   const n = d.length / 4; let lo = 0, hi = 255, a = 0; while (lo < 255 && (a += h[lo]) < n * .01) lo++; a = 0; while (hi > 0 && (a += h[hi]) < n * .01) hi--;
   const k = 255 / Math.max(1, hi - lo);
   for (let i = 0; i < d.length; i += 4) { const v = Math.max(0, Math.min(255, (d[i] - lo) * k)); d[i] = d[i + 1] = d[i + 2] = v; }
@@ -81,10 +97,10 @@ async function readPassport(canvas, log, slot) {
   const { mrz: mrzW, viz: vizW } = slot;
   // printed-page OCR for the upright image starts now on its own worker, in parallel with the MRZ search below
   const vizSpec = vizW.recognize(crop(canvas, 0, VIZ_W, 'gray'), {}, { blocks: true }); vizSpec.catch(() => { });
-  let best = null, bestCanvas = canvas, texts = [];
+  let best = null, bestCanvas = canvas, texts = [], bestPass = null;
   for (const [rot, tilt] of ATTEMPTS) {
     if (best && !best.valid && score(best) >= 4 && rot !== 0) continue; // orientation already plausible: only try small tilts
-    const src = rotate(rotate(canvas, rot), tilt), pairs = []; let local = null;
+    const src = rotate(rotate(canvas, rot), tilt), pairs = [], passRec = []; let local = null;
     // first attempt: tight bottom crop, then looser ones; later attempts only the cheap ones
     const passes = rot === 0 && tilt === 0 ? [[0.72, 'gray'], [0.72, 'bin'], [0.5, 'gray'], [0, 'gray']] : [[0.72, 'gray'], [0.5, 'gray']];
     for (const [y0, mode] of passes) {
@@ -92,7 +108,7 @@ async function readPassport(canvas, log, slot) {
       const cv = crop(src, y0, MRZ_W, mode);
       const { data } = await mrzW.recognize(cv); lap(`mrz ${y0} ${mode} (rot ${rot} tilt ${tilt})`);
       const pr = findMrzLines(data.text); log.push(`[rot ${rot} tilt ${tilt} crop ${y0} ${mode}] ` + (pr ? pr.join(' / ') : '(no MRZ lines) ' + data.text.trim().split('\n').slice(-2).join(' / ')));
-      if (!pr) continue; pairs.push(pr);
+      if (!pr) continue; pairs.push(pr); passRec.push({ data, y0, pr });
       const rec = parseTD3(pr[0], pr[1]); if (score(rec) > score(local)) local = rec;
       if (local.valid) break;
     }
@@ -100,7 +116,7 @@ async function readPassport(canvas, log, slot) {
       const voted = parseTD3(voteLines(pairs.map(q => q[0])), voteLines(pairs.map(q => q[1])));
       log.push(`[vote of ${pairs.length}] ` + voted.mrz1 + ' / ' + voted.mrz2); if (score(voted) > score(local)) local = voted;
     }
-    if (score(local) > score(best)) { best = local; bestCanvas = src; texts = pairs; log.push(`→ best so far score ${score(local)} (rot ${rot}, tilt ${tilt})`); }
+    if (score(local) > score(best)) { best = local; bestCanvas = src; texts = pairs; bestPass = passRec[0] && { ...passRec[0], src }; log.push(`→ best so far score ${score(local)} (rot ${rot}, tilt ${tilt})`); }
     if (best && best.valid) break;
   }
   /* visual zone: reuse the parallel result when the image was already upright */
@@ -109,8 +125,30 @@ async function readPassport(canvas, log, slot) {
   if (bestCanvas === canvas) data = (await vizSpec).data;
   else { await vizSpec.catch(() => { }); data = (await vizW.recognize(crop(bestCanvas, 0, VIZ_W, 'gray'), {}, { blocks: true })).data; }
   lap('printed page');
-  const lines = toCells(data);
-  const viz = parseViz(lines); log.push('[VIZ cells] ' + lines.map(l => `${l.text.trim()}@${l.x0},${l.y0}-${l.x1},${l.y1}`).join(' ⏎ ')); log.push('[VIZ fields] ' + JSON.stringify(viz.fields));
+  let lines = toCells(data), viz = parseViz(lines, best);
+  const need = ['dob', 'expiry', 'issue', 'passportNo', 'personalNo', 'pob'], got = f => need.filter(k => f[k]).length;
+  if (got(viz.fields) < need.length) { // patterned/pink backgrounds or small scans: retry on the red channel only, upscaled more; union of both reads
+    busy('Re-reading printed data (red channel)…');
+    const d2 = (await vizW.recognize(crop(bestCanvas, 0, 2600, 'red'), {}, { blocks: true })).data; lap('printed page (red channel)');
+    const l2 = toCells(d2), v2 = parseViz(l2, best); log.push('[VIZ cells red] ' + l2.map(l => `${l.text.trim()}@${l.x0},${l.y0}-${l.x1},${l.y1}`).join(' ⏎ '));
+    const merged = { ...v2.fields, ...Object.fromEntries(Object.entries(viz.fields).filter(([, v]) => v)) };
+    if (got(v2.fields) > got(viz.fields)) { lines = l2; viz = { fields: { ...viz.fields, ...v2.fields }, found: {} }; } else viz = { fields: merged, found: {} };
+  }
+ log.push('[VIZ cells] ' + lines.map(l => `${l.text.trim()}@${l.x0},${l.y0}-${l.x1},${l.y1}`).join(' ⏎ ')); log.push('[VIZ fields] ' + JSON.stringify(viz.fields));
+  /* names live only in line 1 (no check digit): when the printed name disagrees, re-read line 1 alone at higher resolution
+     and keep whichever candidate reading agrees best with the printed name */
+  if (best && best.mrz1 && viz.fields.fullName && bestPass) {
+    const pf = viz.fields.fullName.replace(/[\s.]/g, ''), st = s => s.replace(/\s/g, '');
+    const dist = r => Math.min(lev(st(r.given) + st(r.surname), pf), lev(st(r.surname) + st(r.given), pf));
+    if (dist(best) > 0) {
+      try {
+        const extra = await rereadLine1(mrzW, bestPass.src, bestPass.y0, bestPass.data, bestPass.pr[0]); lap('line 1 re-read');
+        const earlier = texts.map(q => q[0]), cands = [...earlier, ...extra, voteLines([...earlier, ...extra]), voteLines(extra.length ? extra : earlier)];
+        let pick = best, pd = dist(best); for (const c of cands) { const r = parseTD3(c, best.mrz2); if (r.valid === best.valid && dist(r) < pd) { pick = r; pd = dist(r); } }
+        log.push(`[line 1 re-read] ${extra.join(' / ')} → ${pick === best ? 'kept original' : 'adopted ' + pick.mrz1} (distance ${dist(best)} → ${pd})`); best = pick;
+      } catch (e) { log.push('line 1 re-read failed: ' + e); }
+    }
+  }
   /* re-parse the MRZ with VIZ hints (repairs fields using what is printed on the page) */
   let rec = best;
   if (best && texts.length) {
@@ -124,7 +162,7 @@ async function readPassport(canvas, log, slot) {
 function toCells(data) {
   const L = data.lines || (data.blocks || []).flatMap(b => b.paragraphs.flatMap(q => q.lines)), cells = [];
   for (const l of L) {
-    const ws = (l.words || []).filter(w => w.text.trim()); if (!ws.length) continue;
+    const ws = (l.words || []).filter(w => w.text.trim() && (w.confidence === undefined || w.confidence >= 60 || /\d{3}/.test(w.text) || (w.confidence >= 25 && /^[A-Z][A-Z.'-]{2,}$/.test(w.text.trim())))); if (!ws.length) continue; // drop low-confidence words (Arabic misread as Latin)
     const h = Math.max(10, l.bbox.y1 - l.bbox.y0); let cur = null;
     for (const w of ws) {
       if (cur && w.bbox.x0 - cur.x1 < h * 1.6) { cur.text += ' ' + w.text; cur.x1 = w.bbox.x1; cur.y0 = Math.min(cur.y0, w.bbox.y0); cur.y1 = Math.max(cur.y1, w.bbox.y1); }
@@ -154,6 +192,29 @@ function reconcile(mrz, v) {
     if (rec.nationality === 'BHR') rec.issuer = 'BHR';
     if (!(v.surname && v.given)) rec.mismatch.push('names: MRZ line 1 unclear and printed names not read – verify');
   }
+  { // names: MRZ order is SURNAME<<GIVEN NAMES; if the "<<" was misread everything lands in the surname field → surname = first word
+    if (!rec.given && /\s/.test(rec.surname)) { const tk = rec.surname.split(/\s+/); rec.surname = tk[0]; rec.given = tk.slice(1).join(' '); rec.sources.surname = rec.sources.given = 'name split guessed ("<<" unreadable in MRZ)'; }
+    // glued names ("YASERCALI": '<' misread as C/K/S/L) → split back using the name lexicon; flag what still looks garbled
+    const rs = repairTokens(rec.surname.split(/\s+/).filter(Boolean)), rg = repairTokens(rec.given.split(/\s+/).filter(Boolean));
+    if (rs.changed || rg.changed) { rec.sources.surname = rec.sources.given = `repaired MRZ name (read: ${rec.given} ${rec.surname})`; rec.surname = rs.tokens.join(' '); rec.given = rg.tokens.join(' '); }
+    rec.nameGarbled = rs.garbled || rg.garbled;
+  }
+  if (v.fullName && v.surname) { // names have no check digit: line the printed tokens up with the MRZ tokens (MRZ order/noise differ), keep whichever token reads cleaner
+    const mt = `${rec.given} ${rec.surname}`.split(/\s+/).filter(Boolean), pt = v.fullName.split(/\s+/), used = new Set(); let hit = 0;
+    const match = (m, list, usedSet) => { let best = -1, bd = 99; list.forEach((x, i) => { if (usedSet.has(i)) return; const d = Math.min(lev(m, x), lev(m.replace(/^K|K$/g, ''), x)); if (d < bd) { bd = d; best = i; } }); return best >= 0 && bd <= Math.max(1, Math.floor(m.length / 3)) ? best : -1; };
+    const better = (m, p) => { const c = m.replace(/^K|K$/g, ''); return lev(c, p) <= 2 ? c : p; }; // edge 'K' = misread filler
+    if (rec.given) { // MRZ has a clean "<<" split: keep its structure, only repair individual tokens that the printed name reads better
+      const fix = s => s.split(/\s+/).filter(Boolean).map(m => { const i = match(m, pt, used); if (i < 0) return m; used.add(i); hit++; return better(m, pt[i]); }).join(' ');
+      const g = fix(rec.given), s = fix(rec.surname);
+      if (hit / Math.max(1, Math.min(mt.length, pt.length)) >= 0.5) { if (g !== rec.given || s !== rec.surname) rec.sources.surname = rec.sources.given = `reconciled with printed name (MRZ read: ${rec.given} ${rec.surname})`; rec.given = g; rec.surname = s; }
+      else rec.mismatch.push(`name: MRZ="${rec.given} ${rec.surname}" printed="${v.fullName}"`);
+    } else { // MRZ structure lost (no "<<"): use the printed order, with MRZ tokens where they read cleaner
+      const merged = pt.map(x => { const i = match(x, mt, new Set([...mt.keys()].filter(k => false))); if (i < 0) return x; hit++; return better(mt[i], x); });
+      if (hit / pt.length >= 0.75) { const ng = merged.slice(0, -1).join(' '), ns = merged.slice(-1).join(' '); rec.sources.surname = rec.sources.given = `reconciled with printed name (MRZ read: ${rec.given} ${rec.surname})`; rec.given = ng; rec.surname = ns; }
+      else rec.mismatch.push(`name: MRZ="${rec.given} ${rec.surname}" printed="${v.fullName}"`);
+    }
+    v = { ...v }; delete v.surname; delete v.given;
+  }
   for (const k of ['surname', 'given']) { // names have no check digit: prefer whichever reading agrees best
     const m = rec[k], q = v[k]; if (!m || !q) continue;
     const a = m.replace(/\s/g, ''), b = q.replace(/\s/g, '');
@@ -173,8 +234,10 @@ function reconcile(mrz, v) {
     if (!m && p) { rec[k] = p; rec.sources[k] = 'printed'; }
     else if (m && !p && !mrz.valid) rec.sources[k] = 'MRZ (unverified)';
   }
+  if (/^\d{9}$/.test(rec.personalNo || '') && rec.dob && !rec.personalNo.startsWith(rec.dob.slice(2, 4) + rec.dob.slice(5, 7))) rec.mismatch.push('personalNo: Bahraini CPR numbers start with the birth year+month (YYMM) – verify');
   if (rec.passportNo && !/^[A-Z]{0,2}\d{6,8}$/.test(rec.passportNo)) rec.mismatch.push(`passportNo: unusual format "${rec.passportNo}" – verify letters/digits`);
-  rec.placeOfBirth = v.pob || ''; rec.issueDate = v.issue || ''; rec.authority = v.authority || ''; rec.nationalityText = v.nationality || '';
+  if (rec.nameGarbled && !(v.fullName && v.surname)) rec.mismatch.push(`name: "${rec.given} ${rec.surname}" looks garbled (filler misread) and no printed name to confirm – verify`);
+  rec.occupation = v.occupation || ''; rec.placeOfBirth = v.pob || ''; rec.issueDate = v.issue || ''; rec.authority = v.authority || ''; rec.nationalityText = v.nationality || '';
   rec.vizRead = Object.keys(v).length;
   if (!rec.nationality && /BAHRAIN/.test(rec.nationalityText)) rec.nationality = 'BHR';
   return rec;
