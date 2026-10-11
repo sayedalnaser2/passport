@@ -14,3 +14,6 @@ Serve with `python3 -m http.server` and open `index.html`.
 
 Tests: `node tests/mrz.test.mjs`; `python3 tests/gen_samples.py` makes synthetic passport pages (clean/tilted/upside-down/noisy) to try the UI.
 Limits: OCR is English only (Arabic text is ignored); printed fields without check digits (place of birth, authority, names) can't be verified.
+
+## Speed
+Several passports are read in parallel (one OCR worker pair per slot, up to 3), the printed page is OCR'd at the same time as the MRZ search, rotation/tilt searches only run when the first pass fails, and a 3 MB quantised language model is used instead of the 11 MB default. The debug log lists per-stage timings (⏱).

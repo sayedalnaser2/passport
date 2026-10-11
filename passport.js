@@ -6,7 +6,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const toast = (m, err) => { const t = document.createElement('div'); t.className = 'toast' + (err ? ' err' : ''); t.textContent = m; $('#toasts').append(t); setTimeout(() => t.remove(), err ? 6000 : 3000); };
-const busy = (t, p) => { $('#busy').hidden = t === null; if (t !== null) { $('#busytext').textContent = t; $('#busybar').style.width = (p ?? 0) * 100 + '%'; } };
+const busy = t => { const s = $('#status'); if (s) s.textContent = t ?? ''; }; // non-blocking progress line
 
 const COLS = [
   ['file', 'File'], ['surname', 'Surname'], ['given', 'Given names'], ['passportNo', 'Passport No.'],
@@ -18,16 +18,23 @@ const DATE = new Set(['dob', 'expiry', 'issueDate']);
 const rows = []; // {file, thumb, rec, error}
 
 /* ---------- OCR ---------- */
-let mrzW, vizW;
+const slots = []; // each slot = one worker for the MRZ + one for the printed page, so several passports are read in parallel
 const loadScript = src => new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('Could not load OCR engine (offline?)')); document.head.append(s); });
-async function getWorkers() {
-  if (mrzW) return;
-  await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
-  const logger = m => { if (m.status !== 'recognizing text') busy('Loading OCR engine…', m.progress || 0); };
-  mrzW = await Tesseract.createWorker('eng', 1, { logger });
-  await mrzW.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6', preserve_interword_spaces: '0' });
-  vizW = await Tesseract.createWorker('eng', 1, { logger });
-  await vizW.setParameters({ tessedit_pageseg_mode: '3', preserve_interword_spaces: '1' });
+const LANG = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int'; // 3 MB quantised model (default is 11 MB and slower)
+const MAX_SLOTS = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) >> 1));
+async function makeSlot() {
+  const logger = m => { if (m.status !== 'recognizing text') busy('Loading OCR engine… ' + Math.round((m.progress || 0) * 100) + '%'); };
+  const mrz = await Tesseract.createWorker('eng', 1, { logger, langPath: LANG });
+  await mrz.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', tessedit_pageseg_mode: '6', preserve_interword_spaces: '0' });
+  const viz = await Tesseract.createWorker('eng', 1, { logger, langPath: LANG });
+  await viz.setParameters({ tessedit_pageseg_mode: '3', preserve_interword_spaces: '1' });
+  return { mrz, viz };
+}
+async function ensureSlots(n) {
+  if (!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
+  n = Math.min(n, MAX_SLOTS);
+  if (!slots.length) slots.push(await makeSlot()); // first one alone: fills the language-data cache so the others don't download it again
+  if (slots.length < n) slots.push(...await Promise.all(Array.from({ length: n - slots.length }, makeSlot)));
 }
 /* image helpers */
 function toCanvas(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; }
@@ -39,7 +46,7 @@ function rotate(src, deg) {
 }
 function crop(src, y0, targetW, mode) {
   const sy = Math.floor(src.height * y0), sh = src.height - sy, k = targetW / src.width;
-  const c = toCanvas(targetW, sh * k), x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
+  const c = toCanvas(targetW, sh * k), x = c.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
   x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, sy, src.width, sh, 0, 0, c.width, c.height);
   return mode === 'bin' ? adaptive(c) : mode === 'gray' ? stretch(c) : c;
 }
@@ -67,32 +74,41 @@ const ATTEMPTS = [[0, 0], [180, 0], [0, -3], [0, 3], [90, 0], [270, 0], [180, -3
 const vizHints = v => v ? { passportNo: v.passportNo, dob: v.dob, expiry: v.expiry, personalNo: v.personalNo, sex: v.sex } : {};
 const score = rec => rec ? Object.values(rec.checks).filter(Boolean).length + (rec.issuer === 'BHR' ? 1 : 0) + (rec.nationality === 'BHR' ? 1 : 0) : -1;
 
-/** Full read of one page image → {rec, log, rot}. */
-async function readPassport(canvas, log) {
-  await getWorkers();
+/** Full read of one page image → {rec, log, rot}. slot = {mrz, viz} workers. */
+const VIZ_W = 1800, MRZ_W = 1600;
+async function readPassport(canvas, log, slot) {
+  let t0 = performance.now(); const lap = l => { const t = performance.now(); log.push(`⏱ ${l}: ${Math.round(t - t0)} ms`); t0 = t; };
+  const { mrz: mrzW, viz: vizW } = slot;
+  // printed-page OCR for the upright image starts now on its own worker, in parallel with the MRZ search below
+  const vizSpec = vizW.recognize(crop(canvas, 0, VIZ_W, 'gray'), {}, { blocks: true }); vizSpec.catch(() => { });
   let best = null, bestCanvas = canvas, texts = [];
   for (const [rot, tilt] of ATTEMPTS) {
+    if (best && !best.valid && score(best) >= 4 && rot !== 0) continue; // orientation already plausible: only try small tilts
     const src = rotate(rotate(canvas, rot), tilt), pairs = []; let local = null;
-    busy(`Reading MRZ (rotation ${rot}°${tilt ? ' tilt ' + tilt + '°' : ''})…`, .1);
-    for (const y0 of [0.72, 0.5, 0]) for (const mode of ['gray', 'bin']) {
-      const { data } = await mrzW.recognize(crop(src, y0, 1800, mode));
-      const p = findMrzLines(data.text); log.push(`[rot ${rot} tilt ${tilt} crop ${y0} ${mode}] ` + (p ? p.join(' / ') : '(no MRZ lines) ' + data.text.trim().split('\n').slice(-2).join(' / ')));
-      if (!p) continue; pairs.push(p);
-      const rec = parseTD3(p[0], p[1]); if (score(rec) > score(local)) local = rec;
+    // first attempt: tight bottom crop, then looser ones; later attempts only the cheap ones
+    const passes = rot === 0 && tilt === 0 ? [[0.72, 'gray'], [0.72, 'bin'], [0.5, 'gray'], [0, 'gray']] : [[0.72, 'gray'], [0.5, 'gray']];
+    for (const [y0, mode] of passes) {
+      busy(`Reading MRZ (rotation ${rot}°${tilt ? ', tilt ' + tilt + '°' : ''})…`);
+      const cv = crop(src, y0, MRZ_W, mode);
+      const { data } = await mrzW.recognize(cv); lap(`mrz ${y0} ${mode} (rot ${rot} tilt ${tilt})`);
+      const pr = findMrzLines(data.text); log.push(`[rot ${rot} tilt ${tilt} crop ${y0} ${mode}] ` + (pr ? pr.join(' / ') : '(no MRZ lines) ' + data.text.trim().split('\n').slice(-2).join(' / ')));
+      if (!pr) continue; pairs.push(pr);
+      const rec = parseTD3(pr[0], pr[1]); if (score(rec) > score(local)) local = rec;
       if (local.valid) break;
     }
     if (pairs.length > 1 && !(local && local.valid)) { // character-wise vote across all readings
-      const voted = parseTD3(voteLines(pairs.map(p => p[0])), voteLines(pairs.map(p => p[1])));
+      const voted = parseTD3(voteLines(pairs.map(q => q[0])), voteLines(pairs.map(q => q[1])));
       log.push(`[vote of ${pairs.length}] ` + voted.mrz1 + ' / ' + voted.mrz2); if (score(voted) > score(local)) local = voted;
     }
     if (score(local) > score(best)) { best = local; bestCanvas = src; texts = pairs; log.push(`→ best so far score ${score(local)} (rot ${rot}, tilt ${tilt})`); }
     if (best && best.valid) break;
-    if (best && score(best) >= 5 && rot === 0 && tilt === 0) { /* plausible orientation; skip the 90/180 searches but still try tilts */ }
   }
-  /* visual zone */
-  busy('Reading printed data…', .5);
-  const big = crop(bestCanvas, 0, 2200, 'gray');
-  const { data } = await vizW.recognize(big, {}, { blocks: true });
+  /* visual zone: reuse the parallel result when the image was already upright */
+  busy('Reading printed data…');
+  let data;
+  if (bestCanvas === canvas) data = (await vizSpec).data;
+  else { await vizSpec.catch(() => { }); data = (await vizW.recognize(crop(bestCanvas, 0, VIZ_W, 'gray'), {}, { blocks: true })).data; }
+  lap('printed page');
   const lines = toCells(data);
   const viz = parseViz(lines); log.push('[VIZ cells] ' + lines.map(l => `${l.text.trim()}@${l.x0},${l.y0}-${l.x1},${l.y1}`).join(' ⏎ ')); log.push('[VIZ fields] ' + JSON.stringify(viz.fields));
   /* re-parse the MRZ with VIZ hints (repairs fields using what is printed on the page) */
@@ -183,36 +199,51 @@ async function* pagesOf(file) {
   } else yield [file.name, await imageToCanvas(file)];
 }
 let queue = Promise.resolve();
-const addFiles = files => { files = [...files]; return (queue = queue.then(() => addFilesNow(files))); }; // copy now: the <input> list is cleared right after onchange // never run two OCR jobs at once
-async function addFilesNow(files) {
-  files = [...files];
+const addFiles = files => { files = [...files]; return (queue = queue.then(() => addFilesNow(files))); }; // copy now: the <input> list is cleared right after onchange
+const isPdf = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+async function pdfPage(doc, i) {
+  const pg = await doc.getPage(i), vp = pg.getViewport({ scale: 2400 / pg.getViewport({ scale: 1 }).width });
+  const c = toCanvas(vp.width, vp.height); await pg.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise; return c;
+}
+async function processJob(j, slot) {
+  const r = j.row, t0 = performance.now();
   try {
-    let n = 0;
-    for (const f of files) {
-      n++;
-      try {
-        for await (const [name, canvas] of pagesOf(f)) {
-          busy(`Reading ${name} (${n}/${files.length})…`, (n - 1) / files.length);
-          const th = document.createElement('canvas'); th.width = 120; th.height = Math.round(120 * canvas.height / canvas.width);
-          th.getContext('2d').drawImage(canvas, 0, 0, th.width, th.height);
-          const log = [], t0 = performance.now(); let out;
-          try { out = await readPassport(canvas, log); } catch (e) { console.error(e); log.push('ERROR ' + (e.stack || e)); out = { rec: null, viz: {} }; }
-          log.push(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
-          const rec = out.rec && (out.rec.mrz1 || out.rec.surname || out.rec.passportNo) ? out.rec : null;
-          rows.push({ file: name, thumb: th.toDataURL('image/jpeg', .6), rec, viz: out.viz, log, error: rec ? '' : 'Nothing readable found' });
-          render();
-        }
-      } catch (e) { console.error(e); rows.push({ file: f.name, rec: null, error: String(e.message || e) }); render(); }
-    }
-  } catch (e) { console.error(e); toast(String(e.message || e), true); }
+    const canvas = await j.load();
+    const th = toCanvas(120, 120 * canvas.height / canvas.width); th.getContext('2d').drawImage(canvas, 0, 0, th.width, th.height);
+    r.thumb = th.toDataURL('image/jpeg', .6);
+    let out; try { out = await readPassport(canvas, r.log, slot); } catch (e) { console.error(e); r.log.push('ERROR ' + (e.stack || e)); out = { rec: null, viz: {} }; }
+    r.rec = out.rec && (out.rec.mrz1 || out.rec.surname || out.rec.passportNo) ? out.rec : null; r.viz = out.viz;
+    r.error = r.rec ? '' : 'Nothing readable found';
+  } catch (e) { console.error(e); r.rec = null; r.error = String(e.message || e); r.log.push('ERROR ' + (e.stack || e)); }
+  r.pending = false; r.log.push(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  const i = rows.indexOf(r); if (i >= 0) renderRow(i);
+}
+async function addFilesNow(files) {
+  const jobs = [];
+  for (const f of files) {
+    try {
+      if (isPdf(f)) { const doc = await pdfjsLib.getDocument({ data: new Uint8Array(await f.arrayBuffer()) }).promise; for (let i = 1; i <= doc.numPages; i++) jobs.push({ name: doc.numPages > 1 ? `${f.name} (p${i})` : f.name, load: () => pdfPage(doc, i) }); }
+      else jobs.push({ name: f.name, load: () => imageToCanvas(f) });
+    } catch (e) { console.error(e); jobs.push({ name: f.name, load: async () => { throw e; } }); }
+  }
+  for (const j of jobs) { j.row = { file: j.name, pending: true, rec: null, log: [] }; rows.push(j.row); }
+  render();
+  try {
+    busy('Loading OCR engine…'); await ensureSlots(jobs.length);
+    let next = 0, done = 0; // each slot pulls the next unread passport → several are read at once
+    await Promise.all(slots.slice(0, jobs.length).map(async slot => {
+      while (next < jobs.length) { const j = jobs[next++]; busy(`Reading ${done + 1}–${Math.min(jobs.length, next)} of ${jobs.length}…`); await processJob(j, slot); done++; }
+    }));
+  } catch (e) { console.error(e); toast(String(e.message || e), true); for (const j of jobs) if (j.row.pending) { j.row.pending = false; j.row.error = String(e.message || e); renderRow(rows.indexOf(j.row)); } }
   finally { busy(null); }
-  const bad = rows.filter(r => !r.rec || !r.rec.valid).length;
+  const bad = jobs.filter(j => !j.row.rec || !j.row.rec.valid).length;
   if (bad) toast(`${bad} row(s) need checking (⚠).`, true);
 }
 
 /* ---------- sheet ---------- */
 const val = (r, k) => k === 'file' ? r.file : !r.rec ? '' : DATE.has(k) ? dmy(r.rec[k]) : r.rec[k] ?? '';
 function statusOf(r) {
+  if (r.pending) return ['⏳', 'pending', 'Reading…'];
   if (!r.rec) return ['⚠', 'bad', r.error || 'Not read'];
   const fails = Object.entries(r.rec.checks).filter(([, v]) => !v).map(([k]) => k);
   if (!r.rec.valid) return ['⚠', 'bad', (r.rec.mrz1 ? 'Check digit failed: ' + fails.join(', ') : 'MRZ not found – values come from the printed page only') + '. Please verify manually.' + (r.rec.mismatch?.length ? '\nMRZ vs printed: ' + r.rec.mismatch.join('; ') : '')];
@@ -220,20 +251,27 @@ function statusOf(r) {
   const note = r.rec.repaired ? ' (some characters auto-corrected by check digits)' : '';
   return r.rec.vizRead ? ['✔', 'good', 'MRZ check digits OK and matches printed page' + note] : ['✔', 'good', 'MRZ check digits OK; printed page not read' + note];
 }
+function rowHTML(r, i) {
+  const [ic, cls, tip] = statusOf(r), dis = r.pending ? ' disabled' : '';
+  return `<tr class="${cls}" data-i="${i}"><td class="num" data-dbg title="Click for debug log">${i + 1}</td><td class="thumb-c">${r.thumb ? `<img src="${r.thumb}" alt="">` : ''}</td>` +
+    COLS.map(([k]) => `<td><input title="${esc(r.rec?.sources?.[k] ? 'source: ' + r.rec.sources[k] : '')}" data-k="${k}" value="${esc(val(r, k))}"${k === 'file' ? ' readonly' : dis}></td>`).join('') +
+    `<td class="st" title="${esc(tip)}">${ic}</td>` +
+    `<td class="mrz"><input data-m="1" value="${esc(r.rec?.mrz1)}" spellcheck="false"${dis}></td><td class="mrz"><input data-m="2" value="${esc(r.rec?.mrz2)}" spellcheck="false"${dis}></td>` +
+    `<td class="x"><button data-del title="Remove">✕</button></td></tr>`;
+}
+function summarize() {
+  const ok = rows.filter(r => r.rec?.valid).length, pend = rows.filter(r => r.pending).length;
+  $('#summary').textContent = `${rows.length} passport${rows.length === 1 ? '' : 's'} · ${ok} verified · ${rows.length - ok - pend} to check` + (pend ? ` · ${pend} reading…` : '');
+}
 function render() {
   const tbl = $('#sheet'); tbl.hidden = !rows.length; $('#bar').hidden = !rows.length;
   tbl.tHead.innerHTML = '<tr><th>#</th><th>Scan</th>' + COLS.map(c => `<th>${c[1]}</th>`).join('') + '<th>Status</th><th>MRZ line 1</th><th>MRZ line 2</th><th></th></tr>';
-  tbl.tBodies[0].innerHTML = rows.map((r, i) => {
-    const [ic, cls, tip] = statusOf(r);
-    return `<tr class="${cls}" data-i="${i}"><td class="num" data-dbg title="Click for debug log">${i + 1}</td><td class="thumb-c">${r.thumb ? `<img src="${r.thumb}" alt="">` : ''}</td>` +
-      COLS.map(([k]) => `<td><input title="${esc(r.rec?.sources?.[k] ? 'source: ' + r.rec.sources[k] : '')}" data-k="${k}" value="${esc(val(r, k))}"${k === 'file' ? ' readonly' : ''}></td>`).join('') +
-      `<td class="st" title="${esc(tip)}">${ic}</td>` +
-      `<td class="mrz"><input data-m="1" value="${esc(r.rec?.mrz1)}" spellcheck="false"></td><td class="mrz"><input data-m="2" value="${esc(r.rec?.mrz2)}" spellcheck="false"></td>` +
-      `<td class="x"><button data-del title="Remove">✕</button></td></tr>`;
-  }).join('');
-  showDebug();
-  const ok = rows.filter(r => r.rec?.valid).length;
-  $('#summary').textContent = `${rows.length} passport${rows.length === 1 ? '' : 's'} · ${ok} verified · ${rows.length - ok} to check`;
+  tbl.tBodies[0].innerHTML = rows.map(rowHTML).join('');
+  showDebug(); summarize();
+}
+function renderRow(i) { // update one row in place so typing in other rows isn't interrupted while OCR finishes
+  const tr = $('#sheet').tBodies[0].rows[i]; if (!tr) return render();
+  tr.outerHTML = rowHTML(rows[i], i); showDebug(); summarize();
 }
 $('#sheet').addEventListener('change', e => {
   const tr = e.target.closest('tr'); if (!tr) return; const r = rows[tr.dataset.i];

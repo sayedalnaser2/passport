@@ -52,6 +52,7 @@ export function parseVizDate(s) {
 }
 
 const asDigits = s => s.replace(/[OQD]/g, '0').replace(/[IL]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
+const textField = v => { const t = latin(v).toUpperCase().replace(/[^A-Z ,.-]/g, '').trim(); return (t.match(/[A-Z]/g) || []).length >= 3 ? t : ''; }; // too short = OCR noise
 const CLEAN = {
   passportNo: v => { const t = latin(v).toUpperCase().split(' ').map(x => x.replace(/[^A-Z0-9]/g, '')).find(x => x.length >= 7 && x.length <= 9 && /\d{5}/.test(asDigits(x.slice(1)))); return t || ''; },
   personalNo: v => { const t = latin(v).toUpperCase().replace(/[^A-Z0-9 ]/g, '').split(' ').map(asDigits).find(x => /^\d{8,9}$/.test(x)); return t || ''; },
@@ -59,8 +60,8 @@ const CLEAN = {
   given: v => latin(v).toUpperCase().replace(/[^A-Z' -]/g, '').replace(/\s+/g, ' ').trim(),
   nationality: v => latin(v).toUpperCase().replace(/[^A-Z ]/g, '').trim(),
   sex: v => { const t = latin(v).toUpperCase(); const m = t.match(/\b([MF])\b|(MALE|FEMALE)/); return m ? (m[1] || m[2][0]) : ''; },
-  pob: v => latin(v).toUpperCase().replace(/[^A-Z ,.-]/g, '').trim(),
-  authority: v => latin(v).toUpperCase().replace(/[^A-Z ,.-]/g, '').trim(),
+  pob: v => textField(v),
+  authority: v => textField(v),
   dob: parseVizDate, issue: parseVizDate, expiry: parseVizDate,
 };
 
